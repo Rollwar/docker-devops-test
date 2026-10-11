@@ -1,0 +1,85 @@
+name: kubeconform
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  KUBE_VERSION: "1.29.7"
+
+jobs:
+  # Discover every folder containing manifests -> parallel matrix
+  discover:
+    name: Find manifest folders
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/yannh/kubeconform:v0.6.7-alpine   # all tools inside container
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Install tools
+        run: apk add --no-cache git jq >/dev/null
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build matrix
+        id: set-matrix
+        run: |
+          dirs=$(find . -type f \( -name '*.yaml' -o -name '*.yml' \) \
+                  ! -path './.github/*' -exec dirname {} \; \
+                | sed 's|^\./||' | sort -u | jq -R . | jq -sc .)
+          [ -n "$dirs" ] && [ "$dirs" != "[]" ] || dirs='["."]'
+          echo "Will validate: $dirs"
+          echo "matrix=$dirs" >> "$GITHUB_OUTPUT"
+
+  # One parallel job (container/pod) per folder
+  validate:
+    name: validate ${{ matrix.dir }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        dir: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    container:
+      image: ghcr.io/yannh/kubeconform:v0.6.7-alpine
+    steps:
+      - name: Install tools
+        run: apk add --no-cache git curl jq >/dev/null
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run kubeconform on ./${{ matrix.dir }}
+        run: |
+          find "${{ matrix.dir }}" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 \
+            | xargs -0 -r /kubeconform \
+                -strict \
+                -summary \
+                -ignore-missing-schemas \
+                -kubernetes-version "$KUBE_VERSION"
+
+  # Aggregated status notification
+  notify:
+    name: Notify status
+    needs: [ validate ]
+    if: always()
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Send notification
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RESULT: ${{ needs.validate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          apk add --no-cache curl jq >/dev/null
+          if [ "$RESULT" = "success" ]; then
+            text=":white_check_mark: kubeconform PASSED — all manifests valid"
+          else
+            text=":x: kubeconform FAILED — result: $RESULT"
+          fi
+          payload=$(jq -n --arg text "$text (${GITHUB_REPOSITORY} @ ${GITHUB_REF_NAME}) -> $RUN_URL" '{text: $text}')
+          curl -sfX POST -H 'Content-type: application/json' -d "$payload" "$SLACK_WEBHOOK"
